@@ -1,0 +1,2324 @@
+mod settings;
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use std::sync::Arc;
+
+use akshat_core::trash::{self, Trashed};
+use akshat_core::{Config, Hit, Index, Line, Rect, Shot, ThemeChoice};
+use gpui::{
+    Animation, AnimationExt as _, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context,
+    CursorStyle, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
+    Pixels, Point, RenderImage, SharedString, Subscription, Window, actions, canvas, div,
+    ease_out_quint, img, list, point, prelude::*, px, size,
+};
+
+use crate::grid::{self, Row};
+use crate::images::{self, Images, Lookup};
+use crate::input::{Changed, TextInput};
+use crate::spring::Spring;
+use crate::stats::FrameStats;
+use crate::theme::Theme;
+use settings::{Key, Onboarding, Settings};
+
+actions!(
+    akshat,
+    [
+        Back,
+        Open,
+        Up,
+        Down,
+        Left,
+        Right,
+        PageUp,
+        PageDown,
+        CopyText,
+        CopyImage,
+        OpenExternal,
+        Reveal,
+        Quit,
+        OpenSettings,
+        Toggle,
+        Remove,
+        MarkUp,
+        MarkDown,
+        MarkLeft,
+        MarkRight,
+        MarkAll,
+        Trash,
+        Undo
+    ]
+);
+
+const PAD: f32 = 16.0;
+const GAP: f32 = 8.0;
+const ROW_HEIGHT: f32 = 172.0;
+const RADIUS: f32 = 10.0;
+// Tiles sit PAD in from the panel edge, so the panel's corner is the tile's
+// radius plus that distance and the two curves run parallel.
+const PANEL_RADIUS: f32 = RADIUS + PAD;
+const HEADER: f32 = 64.0;
+
+const DETAIL_TOP: f32 = 56.0;
+const DETAIL_BOTTOM: f32 = 52.0;
+const DETAIL_PAD: f32 = 20.0;
+
+// Motion is kept short everywhere: this is summoned, used and dismissed in a
+// few seconds, dozens of times a day. Springs are in seconds of response,
+// critically damped, and closing is quicker than opening.
+const OPEN_RESPONSE: f32 = 0.26;
+const CLOSE_RESPONSE: f32 = 0.2;
+const FADE_RESPONSE: f32 = 0.14;
+const PRESS: Duration = Duration::from_millis(110);
+const THUMBS_KEPT_HIDDEN: usize = 40;
+const REPAINT_BATCH: Duration = Duration::from_millis(20);
+const TOAST_SHOWN: Duration = Duration::from_millis(1400);
+// Long enough to read it and reach for ctrl z.
+const TOAST_UNDO: Duration = Duration::from_millis(5000);
+const TOAST_FADE: Duration = Duration::from_millis(120);
+// A marked tile's picture shrinks inside its frame, the way photo apps show
+// a selection, so marked and unmarked read apart at a glance without colour.
+const MARK_INSET: f32 = 7.0;
+const MARK: Duration = Duration::from_millis(130);
+// Trashed tiles shrink away (and restored ones grow back) over this long,
+// then the grid closes the gap.
+const TILE_FADE: Duration = Duration::from_millis(180);
+const BAR_IN: Duration = Duration::from_millis(140);
+// Leaving is quicker than arriving, it's the less interesting half.
+const BAR_OUT: Duration = Duration::from_millis(110);
+const BAR_SWAP: Duration = Duration::from_millis(110);
+
+const BROWSE_LIMIT: usize = 20_000;
+const SEARCH_LIMIT: usize = 2_000;
+
+// A few screens of thumbnails either side of where you are. A 480 px wide
+// thumbnail is ~0.5 MB decoded, so this tops out around 60 MB.
+const THUMB_CACHE: usize = 120;
+const THUMB_MAX_SIDE: u32 = 1440;
+// The full view keeps the one on screen and the one it just left, and never
+// decodes past 4K on a side.
+const FULL_CACHE: usize = 2;
+const FULL_MAX_SIDE: u32 = 3840;
+
+pub struct Akshat {
+    index: Index,
+    input: Entity<TextInput>,
+    query: String,
+    hits: Vec<Hit>,
+    /// The lines each hit matched on, looked up the first time its tile is
+    /// drawn rather than for every hit up front.
+    matched: HashMap<i64, Rc<Vec<Line>>>,
+    thumb_paths: Vec<PathBuf>,
+    thumbs: Images,
+    full: Images,
+    searchable: usize,
+
+    rows: Vec<Row>,
+    located: Vec<(usize, usize)>,
+    laid_out_for: f32,
+    list: ListState,
+    selected: usize,
+    /// Bumped on every search so the result highlight replays.
+    generation: usize,
+    /// Where each visible tile was painted last frame, for the open animation.
+    tile_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+
+    detail: Option<Detail>,
+    toast: Option<Toast>,
+    toasts: usize,
+    last_frame: Instant,
+    /// Drawn as a floating panel (layer shell) rather than filling a window.
+    floating: bool,
+    appearance: Option<Subscription>,
+    /// Scroll the selection back into view after the next layout, because
+    /// relaying out the list loses its scroll position.
+    reveal_selected: bool,
+
+    page: Page,
+    /// Focus for settings and onboarding, so typing there doesn't land in
+    /// the search field.
+    panel_focus: FocusHandle,
+    theme_choice: ThemeChoice,
+    /// Whether a window is showing this right now.
+    visible: bool,
+    stats: FrameStats,
+    /// Drawing on the cpu (no usable gpu), see `calm`.
+    software: bool,
+    repaint_pending: bool,
+
+    /// Shots marked for the trash, by id so they survive a refresh, with
+    /// when they were marked so the change can animate.
+    marked: HashMap<i64, Instant>,
+    /// Recently unmarked ones, still animating back.
+    unmarking: HashMap<i64, Instant>,
+    /// Where a shift selection started, and what was marked before it, so
+    /// moving back over the range unmarks it again like a file manager does.
+    anchor: Option<(usize, HashSet<i64>)>,
+    /// Asking "move these to the trash?" and waiting for enter or escape.
+    confirming: bool,
+    /// The last batch moved to the trash, for ctrl z.
+    undo: Vec<Binned>,
+    /// Bumped each time the mark bar appears, so its entrance replays.
+    bar_shown: Option<usize>,
+    bars: usize,
+    /// What the bar said last, kept so it can fade out still saying it.
+    bar_last: Option<Bar>,
+    bar_leaving: Option<Instant>,
+    /// Tiles on their way out to the trash, or back in from it.
+    fading: HashMap<i64, Fade>,
+    /// Bumped per trash, so a stale "close the gap" timer does nothing.
+    leaves: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Fade {
+    arriving: bool,
+    since: Instant,
+    /// Leaving tiles keep their marked look all the way out.
+    marked: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Bar {
+    count: usize,
+    confirming: bool,
+    can_mark_more: bool,
+}
+
+/// Everything needed to put a trashed shot back, index rows included, so
+/// undoing doesn't make the watcher read it all over again.
+struct Binned {
+    trashed: Trashed,
+    shot: Shot,
+    lines: Vec<Line>,
+}
+
+enum Page {
+    Search,
+    Settings(Settings),
+    Onboarding(Onboarding),
+}
+
+struct Toast {
+    message: SharedString,
+    /// A key hint shown after the message, like "ctrl z undo".
+    keys: Option<(&'static str, &'static str)>,
+    id: usize,
+    leaving: bool,
+}
+
+struct Detail {
+    hit: usize,
+    lines: Vec<Line>,
+    matched: Vec<bool>,
+    /// 0 is the tile in the grid, 1 is the full view.
+    open: Spring,
+    /// Whether it moves out of the tile, or just fades in place.
+    grow: bool,
+    from: Bounds<Pixels>,
+    image_rect: Bounds<Pixels>,
+    hovered: Option<usize>,
+    drag: Option<(Point<Pixels>, Point<Pixels>)>,
+    picked: Vec<usize>,
+}
+
+impl Akshat {
+    pub fn new(index: Index, floating: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let searchable = index.visible_len().unwrap_or(0);
+        let input = cx.new(|cx| TextInput::new(placeholder(searchable), cx));
+        cx.subscribe(&input, |this, _, _: &Changed, cx| this.search(cx))
+            .detach();
+        // Only a missing config means "never set up". One that doesn't parse
+        // (a typo made by hand) falls back to defaults rather than sending
+        // someone through onboarding, which would overwrite their file.
+        let (config, set_up) = match Config::load() {
+            Ok(Some(config)) => (config, true),
+            Ok(None) => (Config::default(), false),
+            Err(_) => (Config::default(), true),
+        };
+
+        // While a backfill runs, new shots keep landing in the index. Checking
+        // the count now and then lets them show up without reopening.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let mut this = Self {
+            index,
+            input,
+            query: String::new(),
+            hits: Vec::new(),
+            matched: HashMap::new(),
+            thumb_paths: Vec::new(),
+            thumbs: Images::new(THUMB_CACHE, THUMB_MAX_SIDE),
+            full: Images::new(FULL_CACHE, FULL_MAX_SIDE),
+            searchable,
+            rows: Vec::new(),
+            located: Vec::new(),
+            laid_out_for: 0.0,
+            list: ListState::new(0, ListAlignment::Top, px(ROW_HEIGHT * 3.0)),
+            selected: 0,
+            generation: 0,
+            tile_bounds: Rc::default(),
+            detail: None,
+            toast: None,
+            toasts: 0,
+            last_frame: Instant::now(),
+            floating,
+            appearance: None,
+            reveal_selected: false,
+            page: Page::Search,
+            panel_focus: cx.focus_handle(),
+            theme_choice: config.theme,
+            visible: true,
+            stats: FrameStats::new(),
+            software: false,
+            repaint_pending: false,
+            marked: HashMap::new(),
+            unmarking: HashMap::new(),
+            anchor: None,
+            confirming: false,
+            undo: Vec::new(),
+            bar_shown: None,
+            bars: 0,
+            bar_last: None,
+            bar_leaving: None,
+            fading: HashMap::new(),
+            leaves: 0,
+        };
+        // No config means onboarding was never finished.
+        if !set_up {
+            this.start_onboarding(cx);
+        }
+        this.attach(window, cx);
+        this.search(cx);
+        this
+    }
+
+    /// Everything that belongs to one particular window. The view outlives
+    /// its windows (every summon is a new one), so this runs for each.
+    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.set_global(Theme::resolve(self.theme_choice, window.appearance()));
+        self.appearance = Some(cx.observe_window_appearance(window, |this, window, cx| {
+            cx.set_global(Theme::resolve(this.theme_choice, window.appearance()));
+            cx.notify();
+        }));
+        self.tile_bounds.borrow_mut().clear();
+        self.last_frame = Instant::now();
+        self.visible = true;
+        self.software = window.gpu_specs().is_some_and(|g| g.is_software_emulated);
+    }
+
+    /// Thumbnails finish decoding one at a time, a page of them within a few
+    /// dozen milliseconds. Repainting for each one is 30 frames where two
+    /// would do, which costs nothing on a gpu and a lot without one. So
+    /// finished images wait up to one repaint interval and go in together.
+    fn repaint_soon(&mut self, cx: &mut Context<Self>) {
+        if self.repaint_pending {
+            return;
+        }
+        self.repaint_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REPAINT_BATCH).await;
+            let _ = this.update(cx, |this, cx| {
+                this.repaint_pending = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Whether to skip decorative motion: when the system asks for reduced
+    /// motion, and when there's no gpu. Drawn in software every animated
+    /// frame is real cpu work (a 1180x780 frame is ~27 ms of llvmpipe on a
+    /// fast laptop, more on the kind that has no gpu), so a short fade
+    /// instead of a flying tile is both smoother and kinder to the battery.
+    fn calm(&self, cx: &App) -> bool {
+        self.software || cx.reduce_motion()
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !matches!(self.page, Page::Search) {
+            return;
+        }
+        let searchable = self.index.visible_len().unwrap_or(self.searchable);
+        if searchable != self.searchable {
+            self.searchable = searchable;
+            self.input.update(cx, |input, cx| {
+                input.placeholder = placeholder(searchable);
+                cx.notify();
+            });
+            self.refresh(cx);
+            cx.notify();
+        }
+    }
+
+    /// Called when the same view is put into a new window, which is what
+    /// makes it open exactly where it was left: same query, same selection,
+    /// same scroll, even the same shot open. Only if screenshots arrived in
+    /// the meantime are the results redone, keeping the selection.
+    pub fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.attach(window, cx);
+        let searchable = self.index.visible_len().unwrap_or(self.searchable);
+        if searchable != self.searchable {
+            self.searchable = searchable;
+            self.input.update(cx, |input, cx| {
+                input.placeholder = placeholder(searchable);
+                cx.notify();
+            });
+            self.refresh(cx);
+        }
+        cx.notify();
+    }
+
+    /// Hidden, keep about a screen of thumbnails so reopening is instant,
+    /// and let the rest go.
+    pub fn hidden(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        // A question left hanging would greet the next summon with a
+        // trash prompt nobody remembers asking for.
+        self.confirming = false;
+        self.stats.report();
+        self.thumbs.shrink_to(THUMBS_KEPT_HIDDEN, cx);
+        self.full.shrink_to(1, cx);
+    }
+
+    /// Runs the current query again without resetting where you are.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let selected = self.hits.get(self.selected).map(|h| h.id);
+        let open = self
+            .detail
+            .as_ref()
+            .and_then(|d| self.hits.get(d.hit))
+            .map(|h| h.id);
+
+        self.load_hits(cx);
+        let present: HashSet<i64> = self.hits.iter().map(|h| h.id).collect();
+        self.marked.retain(|id, _| present.contains(id));
+        self.anchor = None;
+        let at = |id: Option<i64>| id.and_then(|id| self.hits.iter().position(|h| h.id == id));
+        self.selected = at(selected).unwrap_or(0);
+        match (at(open), self.detail.as_mut()) {
+            (Some(ix), Some(d)) => d.hit = ix,
+            _ => self.detail = None,
+        }
+        self.laid_out_for = 0.0;
+        self.reveal_selected = true;
+    }
+
+    fn load_hits(&mut self, cx: &mut Context<Self>) {
+        let query = self.input.read(cx).content.to_string();
+        let limit = if query.trim().is_empty() {
+            BROWSE_LIMIT
+        } else {
+            SEARCH_LIMIT
+        };
+        self.hits = self.index.find(&query, limit).unwrap_or_default();
+        self.matched.clear();
+        self.thumb_paths = self
+            .hits
+            .iter()
+            .map(|h| akshat_core::thumb_path(&h.path).unwrap_or_default())
+            .collect();
+        self.query = query;
+    }
+
+    fn search(&mut self, cx: &mut Context<Self>) {
+        // Marks belong to the results they were made on. Carrying them into
+        // a new search would trash shots that aren't even on screen.
+        self.marked.clear();
+        self.unmarking.clear();
+        self.anchor = None;
+        self.confirming = false;
+        self.fading.clear();
+        self.leaves += 1;
+        self.load_hits(cx);
+        self.generation += 1;
+        self.selected = 0;
+        self.laid_out_for = 0.0;
+        self.detail = None;
+        self.list.scroll_to(ListOffset::default());
+        cx.notify();
+    }
+
+    /// The decoded image for a path, or None while it decodes in the
+    /// background (the view repaints when it lands).
+    /// `original` is the screenshot a thumbnail was made from. If the
+    /// thumbnail is missing (cleared in settings, say) it gets redrawn from
+    /// that. None for full size images.
+    fn image(
+        &mut self,
+        path: &Path,
+        original: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
+        let full = original.is_none();
+        let store = if full {
+            &mut self.full
+        } else {
+            &mut self.thumbs
+        };
+        let max_side = match store.get(path, window, cx) {
+            Lookup::Ready(image) => return Some(image),
+            Lookup::Pending => return None,
+            Lookup::Start(max_side) => max_side,
+        };
+        let path = path.to_owned();
+        let original = original.map(Path::to_owned);
+        cx.spawn(async move |this, cx| {
+            let decoding = path.clone();
+            let image = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(original) = original.filter(|_| !decoding.exists()) {
+                        images::write_thumbnail(&original, &decoding);
+                    }
+                    images::decode(&decoding, max_side)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let store = if full {
+                    &mut this.full
+                } else {
+                    &mut this.thumbs
+                };
+                store.finish(&path, image);
+                this.repaint_soon(cx);
+            });
+        })
+        .detach();
+        None
+    }
+
+    fn matched_lines(&mut self, item: usize) -> Rc<Vec<Line>> {
+        let Some(hit) = self.hits.get(item) else {
+            return Rc::default();
+        };
+        if !self.searching() {
+            return Rc::default();
+        }
+        let (index, query) = (&self.index, &self.query);
+        self.matched
+            .entry(hit.id)
+            .or_insert_with(|| Rc::new(index.matching_lines(hit.id, query).unwrap_or_default()))
+            .clone()
+    }
+
+    fn corner(&self) -> Pixels {
+        if self.floating {
+            px(PANEL_RADIUS)
+        } else {
+            px(0.)
+        }
+    }
+
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    fn relayout(&mut self, width: f32) {
+        let aspects: Vec<f32> = self
+            .hits
+            .iter()
+            .map(|h| akshat_core::tile_aspect(h.width, h.height))
+            .collect();
+        self.rows = grid::justify(&aspects, width, ROW_HEIGHT, GAP);
+        self.located = grid::locate(&self.rows, self.hits.len());
+        self.laid_out_for = width;
+        self.list.reset(self.rows.len());
+        if std::mem::take(&mut self.reveal_selected)
+            && let Some(&(row, _)) = self.located.get(self.selected)
+        {
+            self.list.scroll_to_reveal_item(row);
+        }
+    }
+
+    fn select(&mut self, item: Option<usize>, cx: &mut Context<Self>) {
+        self.anchor = None;
+        self.move_to(item, cx);
+    }
+
+    fn move_to(&mut self, item: Option<usize>, cx: &mut Context<Self>) {
+        let Some(item) = item.filter(|i| *i < self.hits.len()) else {
+            return;
+        };
+        self.confirming = false;
+        self.selected = item;
+        if let Some(&(row, _)) = self.located.get(item) {
+            self.list.scroll_to_reveal_item(row);
+        }
+        if self.detail.is_some() {
+            self.show(item, cx);
+        }
+        cx.notify();
+    }
+
+    // Marking shots for the trash. Ctrl click marks one, shift click or
+    // shift and the arrows mark a run, ctrl shift a marks everything found.
+
+    fn set_mark(&mut self, id: i64, on: bool) {
+        let now = Instant::now();
+        if on {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.marked.entry(id) {
+                e.insert(now);
+                self.unmarking.remove(&id);
+            }
+        } else if self.marked.remove(&id).is_some() {
+            self.unmarking.insert(id, now);
+        }
+    }
+
+    fn clear_marks(&mut self) {
+        for id in self.marked.keys().copied().collect::<Vec<_>>() {
+            self.set_mark(id, false);
+        }
+        self.anchor = None;
+        self.confirming = false;
+    }
+
+    fn toggle_mark(&mut self, item: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.hits.get(item).map(|h| h.id) else {
+            return;
+        };
+        let on = !self.marked.contains_key(&id);
+        self.set_mark(id, on);
+        self.select(Some(item), cx);
+    }
+
+    /// Marks the run from the anchor to `to`, on top of whatever was marked
+    /// before the run started.
+    fn extend_to(&mut self, to: Option<usize>, cx: &mut Context<Self>) {
+        let Some(to) = to.filter(|i| *i < self.hits.len()) else {
+            return;
+        };
+        let (anchor, before) = match self.anchor.take() {
+            Some(a) => a,
+            None => (self.selected, self.marked.keys().copied().collect()),
+        };
+        let (lo, hi) = (anchor.min(to), anchor.max(to));
+        let run: HashSet<i64> = self.hits[lo..=hi].iter().map(|h| h.id).collect();
+        let stale: Vec<i64> = self
+            .marked
+            .keys()
+            .filter(|id| !run.contains(id) && !before.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.set_mark(id, false);
+        }
+        for id in run {
+            self.set_mark(id, true);
+        }
+        self.anchor = Some((anchor, before));
+        self.move_to(Some(to), cx);
+    }
+
+    fn mark_up(&mut self, _: &MarkUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() || self.detail.is_some() {
+            return;
+        }
+        let to = self
+            .located
+            .get(self.selected)
+            .and_then(|&at| grid::vertical(&self.rows, at, false));
+        self.extend_to(to, cx);
+    }
+
+    fn mark_down(&mut self, _: &MarkDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() || self.detail.is_some() {
+            return;
+        }
+        let to = self
+            .located
+            .get(self.selected)
+            .and_then(|&at| grid::vertical(&self.rows, at, true));
+        self.extend_to(to, cx);
+    }
+
+    fn mark_left(&mut self, _: &MarkLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.on_panel() && self.detail.is_none() {
+            self.extend_to(self.selected.checked_sub(1), cx);
+        }
+    }
+
+    fn mark_right(&mut self, _: &MarkRight, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.on_panel() && self.detail.is_none() {
+            self.extend_to(Some(self.selected + 1), cx);
+        }
+    }
+
+    fn mark_all(&mut self, _: &MarkAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() || self.detail.is_some() {
+            return;
+        }
+        // With no query that would be the whole library, two keys away from
+        // the trash. Narrowing it down first is the point anyway.
+        if !self.searching() {
+            self.flash("search first, then mark everything it finds", cx);
+            return;
+        }
+        for id in self.hits.iter().map(|h| h.id).collect::<Vec<_>>() {
+            self.set_mark(id, true);
+        }
+        self.anchor = None;
+        cx.notify();
+    }
+
+    /// What ctrl delete acts on: the open shot, else the marked ones, else
+    /// the selected one. In result order, so the toast and undo match the grid.
+    fn trash_targets(&self) -> Vec<usize> {
+        if let Some(d) = self.detail.as_ref().filter(|d| d.open.target() == 1.0) {
+            return vec![d.hit];
+        }
+        if self.marked.is_empty() {
+            return (self.selected < self.hits.len())
+                .then_some(self.selected)
+                .into_iter()
+                .collect();
+        }
+        (0..self.hits.len())
+            .filter(|&i| self.marked.contains_key(&self.hits[i].id))
+            .collect()
+    }
+
+    /// Ctrl delete asks first, a second ctrl delete or enter goes ahead.
+    fn trash(&mut self, _: &Trash, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() || self.trash_targets().is_empty() {
+            return;
+        }
+        if self.confirming {
+            self.trash_now(cx);
+        } else {
+            self.confirming = true;
+            cx.notify();
+        }
+    }
+
+    fn trash_now(&mut self, cx: &mut Context<Self>) {
+        self.confirming = false;
+        let targets = self.trash_targets();
+        let Some(&first) = targets.first() else {
+            return;
+        };
+        let mut batch = Vec::new();
+        let mut failed = 0;
+        for &i in &targets {
+            let hit = &self.hits[i];
+            let lines = self.index.lines(hit.id).unwrap_or_default();
+            match trash::trash(&hit.path) {
+                Ok(trashed) => {
+                    // The watcher would notice the file leaving too, but it
+                    // may not be running, and the grid shouldn't wait for it.
+                    let _ = self.index.remove(&hit.path);
+                    batch.push(Binned {
+                        trashed,
+                        shot: Shot {
+                            path: hit.path.clone(),
+                            mtime: hit.mtime,
+                            width: hit.width,
+                            height: hit.height,
+                        },
+                        lines,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    failed += 1;
+                }
+            }
+        }
+
+        let moved = batch.len();
+        // The files are already gone at this point. What's left is only the
+        // grid letting go of them: they shrink and fade where they sit, and
+        // only then does the grid close up around the gap.
+        let now = Instant::now();
+        for b in &batch {
+            if let Some(hit) = self.hits.iter().find(|h| h.path == b.shot.path) {
+                let marked = self.marked.contains_key(&hit.id);
+                self.fading.insert(
+                    hit.id,
+                    Fade {
+                        arriving: false,
+                        since: now,
+                        marked,
+                    },
+                );
+            }
+        }
+        if moved > 0 {
+            self.undo = batch;
+        }
+        self.marked.clear();
+        self.unmarking.clear();
+        self.anchor = None;
+        if let Some(d) = self.detail.as_mut() {
+            // The tile it would fly back to is leaving, so it fades instead.
+            d.grow = false;
+            d.open.set_response(FADE_RESPONSE, 1.0);
+            d.open.set_target(0.0);
+            self.last_frame = Instant::now();
+        }
+        self.leaves += 1;
+        let token = self.leaves;
+        let settle = move |this: &mut Self, cx: &mut Context<Self>| {
+            if this.leaves != token {
+                return;
+            }
+            this.fading.retain(|_, f| f.arriving);
+            this.after_change(cx);
+            this.selected = first.min(this.hits.len().saturating_sub(1));
+            this.reveal_selected = true;
+        };
+        if self.calm(cx) || moved == 0 {
+            settle(self, cx);
+        } else {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TILE_FADE).await;
+                let _ = this.update(cx, |this, cx| settle(this, cx));
+            })
+            .detach();
+        }
+        cx.notify();
+
+        let message = match (moved, failed) {
+            (0, _) => "couldn't move it to the trash".to_string(),
+            (1, 0) => "moved to the trash".to_string(),
+            (n, 0) => format!("moved {} to the trash", thousands(n)),
+            (n, f) => format!("moved {}, {} couldn't be moved", thousands(n), thousands(f)),
+        };
+        if moved > 0 {
+            self.flash_with(message, Some(("ctrl z", "undo")), TOAST_UNDO, cx);
+        } else {
+            self.flash(message, cx);
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() || self.undo.is_empty() {
+            return;
+        }
+        // An undo straight after the trash, before its tiles finished
+        // leaving, takes over from that settle.
+        self.leaves += 1;
+        self.fading.clear();
+        let mut back = Vec::new();
+        let mut failed = 0;
+        for u in std::mem::take(&mut self.undo) {
+            match trash::restore(&u.trashed) {
+                Ok(()) => {
+                    if let Ok(id) = self.index.insert(&u.shot, &u.lines) {
+                        back.push(id);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    failed += 1;
+                }
+            }
+        }
+        self.after_change(cx);
+        // What came back grows back in, and stays marked so it's plain
+        // which ones they were.
+        let now = Instant::now();
+        for &id in &back {
+            self.set_mark(id, true);
+            self.fading.insert(
+                id,
+                Fade {
+                    arriving: true,
+                    since: now,
+                    marked: true,
+                },
+            );
+        }
+        if let Some(i) = self.hits.iter().position(|h| back.contains(&h.id)) {
+            self.selected = i;
+            self.reveal_selected = true;
+        }
+        let message = match (back.len(), failed) {
+            (0, _) => "couldn't put them back".to_string(),
+            (1, 0) => "put back".to_string(),
+            (n, 0) => format!("put back {}", thousands(n)),
+            (n, f) => format!("put back {}, {} couldn't be", thousands(n), thousands(f)),
+        };
+        self.flash(message, cx);
+    }
+
+    /// After shots leave or come back: recount, rerun the query, relayout.
+    fn after_change(&mut self, cx: &mut Context<Self>) {
+        self.searchable = self.index.visible_len().unwrap_or(self.searchable);
+        let searchable = self.searchable;
+        self.input.update(cx, |input, cx| {
+            input.placeholder = placeholder(searchable);
+            cx.notify();
+        });
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    // Actions. They're bound at the root, so they arrive whether the search
+    // field or anything else has focus.
+
+    /// Settings and onboarding take over the arrows, enter and escape.
+    fn on_panel(&self) -> bool {
+        !matches!(self.page, Page::Search)
+    }
+
+    fn back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_back(window, cx);
+        }
+        if self.confirming {
+            self.confirming = false;
+            cx.notify();
+            return;
+        }
+        // A shot already on its way closed doesn't eat a second escape, that
+        // one goes to the next step. Pressing escape twice quickly should do
+        // two things, not one, whatever speed the machine animates at.
+        let closing = self.detail.as_ref().is_some_and(|d| d.open.target() == 0.0);
+        if let Some(d) = self.detail.as_mut().filter(|_| !closing) {
+            if d.grow {
+                d.open.set_response(CLOSE_RESPONSE, 1.0);
+            }
+            d.open.set_target(0.0);
+            self.last_frame = Instant::now();
+        } else if !self.marked.is_empty() {
+            self.clear_marks();
+        } else if self.searching() {
+            self.input.update(cx, |input, cx| input.clear(cx));
+        } else {
+            // Resident, this just hides. With --once it's the last window
+            // and the app exits with it.
+            window.remove_window();
+        }
+        cx.notify();
+    }
+
+    /// Enter opens the full view, and from there, the file itself.
+    fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_key(Key::Enter, window, cx);
+        }
+        if self.confirming {
+            return self.trash_now(cx);
+        }
+        if self.detail.as_ref().is_some_and(|d| d.open.target() == 1.0) {
+            self.open_selected(cx);
+        } else {
+            self.show(self.selected, cx);
+        }
+    }
+
+    fn toggle(&mut self, _: &Toggle, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel_key(Key::Space, window, cx);
+    }
+
+    fn remove(&mut self, _: &Remove, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel_key(Key::Remove, window, cx);
+    }
+
+    fn open_settings_action(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.page, Page::Search) {
+            self.open_settings(window, cx);
+        }
+    }
+
+    fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_key(Key::Up, window, cx);
+        }
+        if self.detail.is_none() {
+            let to = self
+                .located
+                .get(self.selected)
+                .and_then(|&at| grid::vertical(&self.rows, at, false));
+            self.select(to, cx);
+        }
+    }
+
+    fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_key(Key::Down, window, cx);
+        }
+        if self.detail.is_none() {
+            let to = self
+                .located
+                .get(self.selected)
+                .and_then(|&at| grid::vertical(&self.rows, at, true));
+            self.select(to, cx);
+        }
+    }
+
+    fn left(&mut self, _: &Left, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_key(Key::Left, window, cx);
+        }
+        self.select(self.selected.checked_sub(1), cx);
+    }
+
+    fn right(&mut self, _: &Right, window: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return self.panel_key(Key::Right, window, cx);
+        }
+        self.select(Some(self.selected + 1), cx);
+    }
+
+    fn jump(&mut self, down: bool, cx: &mut Context<Self>) {
+        let mut at = self.selected;
+        for _ in 0..4 {
+            match self
+                .located
+                .get(at)
+                .and_then(|&loc| grid::vertical(&self.rows, loc, down))
+            {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+        self.select(Some(at), cx);
+    }
+
+    fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.on_panel() {
+            self.jump(false, cx);
+        }
+    }
+
+    fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.on_panel() {
+            self.jump(true, cx);
+        }
+    }
+
+    fn copy_text(&mut self, _: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
+        if self.on_panel() {
+            return;
+        }
+        let lines = match &self.detail {
+            Some(d) if !d.picked.is_empty() => {
+                d.picked.iter().map(|&i| d.lines[i].clone()).collect()
+            }
+            Some(d) => d.lines.clone(),
+            None => match self.hits.get(self.selected) {
+                Some(hit) => self.index.lines(hit.id).unwrap_or_default(),
+                None => return,
+            },
+        };
+        if lines.is_empty() {
+            self.flash("no text in this one", cx);
+            return;
+        }
+        let text = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        copy_text(&text, cx);
+        let what = if lines.len() == 1 {
+            "copied 1 line".into()
+        } else {
+            format!("copied {} lines", lines.len())
+        };
+        self.flash(what, cx);
+    }
+
+    fn copy_image(&mut self, _: &CopyImage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(hit) = self.hits.get(self.selected).filter(|_| !self.on_panel()) else {
+            return;
+        };
+        let message = if copy_image(&hit.path) {
+            "copied the image"
+        } else {
+            "couldn't copy the image, is wl-copy installed?"
+        };
+        self.flash(message, cx);
+    }
+
+    fn open_external(&mut self, _: &OpenExternal, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_selected(cx);
+    }
+
+    fn open_selected(&self, cx: &mut Context<Self>) {
+        if let Some(hit) = self.hits.get(self.selected) {
+            cx.open_with_system(&hit.path);
+        }
+    }
+
+    fn reveal(&mut self, _: &Reveal, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(hit) = self.hits.get(self.selected) {
+            cx.reveal_path(&hit.path);
+        }
+    }
+
+    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
+    }
+
+    /// Opens the full view of a shot, or switches to it if one is already open.
+    fn show(&mut self, item: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.hits.get(item).map(|h| h.id) else {
+            return;
+        };
+        let hits_here = self.matched_lines(item);
+        let lines = self.index.lines(id).unwrap_or_default();
+        let matched = lines.iter().map(|l| hits_here.contains(l)).collect();
+        self.selected = item;
+
+        if let Some(d) = &mut self.detail {
+            d.hit = item;
+            d.lines = lines;
+            d.matched = matched;
+            d.hovered = None;
+            d.picked.clear();
+            if d.grow {
+                d.open.set_response(OPEN_RESPONSE, 1.0);
+            }
+            d.open.set_target(1.0);
+        } else {
+            let tile = self.tile_bounds.borrow().get(&item).copied();
+            let from = tile.unwrap_or_else(|| {
+                Bounds::centered_at(point(px(400.), px(300.)), size(px(80.), px(60.)))
+            });
+            // With reduced motion the shot doesn't fly out of its tile, it
+            // fades in where it's going to be.
+            let grow = !self.calm(cx);
+            let mut open = Spring::new(0.0, if grow { OPEN_RESPONSE } else { FADE_RESPONSE }, 1.0);
+            open.set_target(1.0);
+            self.detail = Some(Detail {
+                hit: item,
+                lines,
+                matched,
+                open,
+                grow,
+                from,
+                image_rect: from,
+                hovered: None,
+                drag: None,
+                picked: Vec::new(),
+            });
+        }
+        self.last_frame = Instant::now();
+        cx.notify();
+    }
+
+    fn flash(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.flash_with(message, None, TOAST_SHOWN, cx);
+    }
+
+    fn flash_with(
+        &mut self,
+        message: impl Into<SharedString>,
+        keys: Option<(&'static str, &'static str)>,
+        shown: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts += 1;
+        let id = self.toasts;
+        self.toast = Some(Toast {
+            message: message.into(),
+            keys,
+            id,
+            leaving: false,
+        });
+        cx.spawn(async move |this, cx| {
+            // Shown, then faded out, then gone. A newer toast takes over and
+            // this one's timers do nothing.
+            for leaving in [true, false] {
+                let wait = if leaving { shown } else { TOAST_FADE };
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |this, cx| {
+                    let Some(toast) = this.toast.as_mut().filter(|t| t.id == id) else {
+                        return;
+                    };
+                    if leaving {
+                        toast.leaving = true;
+                    } else {
+                        this.toast = None;
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    // The full view's mouse handling. Hovering shows which line is under the
+    // pointer, clicking copies it, dragging copies every line the box touches.
+
+    fn line_at(&self, p: Point<Pixels>) -> Option<usize> {
+        let d = self.detail.as_ref()?;
+        d.lines
+            .iter()
+            .position(|l| on_screen(l.rect, d.image_rect).contains(&p))
+    }
+
+    fn detail_mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let hovered = self.line_at(e.position);
+        let Some(d) = &mut self.detail else { return };
+        if let Some((start, _)) = d.drag {
+            d.drag = Some((start, e.position));
+            let area = Bounds::from_corners(start.min(&e.position), start.max(&e.position));
+            d.picked = (0..d.lines.len())
+                .filter(|&i| on_screen(d.lines[i].rect, d.image_rect).intersects(&area))
+                .collect();
+            cx.notify();
+        } else if d.hovered != hovered {
+            d.hovered = hovered;
+            cx.notify();
+        }
+    }
+
+    fn detail_mouse_down(&mut self, e: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(d) = &mut self.detail {
+            d.drag = Some((e.position, e.position));
+            d.picked.clear();
+            cx.notify();
+        }
+    }
+
+    fn detail_mouse_up(&mut self, e: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let clicked = self.line_at(e.position);
+        let Some(d) = &mut self.detail else { return };
+        let Some((start, _)) = d.drag.take() else {
+            return;
+        };
+        let dragged =
+            (e.position.x - start.x).abs() > px(4.) || (e.position.y - start.y).abs() > px(4.);
+        if !dragged {
+            d.picked = clicked.into_iter().collect();
+        }
+        if d.picked.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.copy_text(&CopyText, window, cx);
+    }
+
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(ix) else {
+            return div().into_any_element();
+        };
+        let height = row.height;
+        let tiles: Vec<AnyElement> = row
+            .tiles
+            .clone()
+            .into_iter()
+            .map(|t| self.render_tile(t.item, t.width, height, window, cx))
+            .collect();
+        div()
+            .flex()
+            .gap(px(GAP))
+            .px(px(PAD))
+            .py(px(GAP / 2.0))
+            .children(tiles)
+            .into_any_element()
+    }
+
+    fn render_tile(
+        &mut self,
+        i: usize,
+        w: f32,
+        h: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.global::<Theme>();
+        let path = self.thumb_paths[i].clone();
+        let original = self.hits[i].path.clone();
+        let thumb = self.image(&path, Some(&original), window, cx);
+        let lines = self.matched_lines(i);
+        let hit = &self.hits[i];
+        let (id, crop) = (hit.id, akshat_core::tile_crop(hit.width, hit.height));
+        let sink = self.tile_bounds.clone();
+        let calm = self.calm(cx);
+
+        let (mut m, moving) = self.mark_progress(id, calm);
+        if moving {
+            window.request_animation_frame();
+        } else if !self.marked.contains_key(&id) {
+            self.unmarking.remove(&id);
+        }
+        // 1 is fully here, 0 is gone to the trash (or not back from it yet).
+        let (presence, fading) = self.presence(id, calm);
+        if fading {
+            window.request_animation_frame();
+        } else if self.fading.get(&id).is_some_and(|f| f.arriving) {
+            self.fading.remove(&id);
+        }
+        if self
+            .fading
+            .get(&id)
+            .is_some_and(|f| !f.arriving && f.marked)
+        {
+            m = 1.0;
+        }
+        // The picture and everything drawn on it live in an inner frame that
+        // shrinks when marked, so the highlight boxes shrink right along.
+        let inset = MARK_INSET * m + (1.0 - presence) * w.min(h) * 0.16;
+        let (iw, ih) = (w - inset * 2., h - inset * 2.);
+        let radius = px(RADIUS - (RADIUS - 6.) * m);
+
+        let mut inner = div()
+            .absolute()
+            .left(px(inset))
+            .top(px(inset))
+            .w(px(iw))
+            .h(px(ih))
+            .children(
+                thumb
+                    .clone()
+                    .map(|t| img(t).absolute().size_full().rounded(radius)),
+            );
+
+        // Dim the image so matching text stands out.
+        if let Some(thumb) = thumb.filter(|_| !lines.is_empty()) {
+            inner = inner.child(div().absolute().size_full().rounded(radius).bg(theme.veil));
+            for (j, line) in lines.iter().enumerate() {
+                let Some(b) = in_tile(line.rect, crop, iw, ih) else {
+                    continue;
+                };
+                let lit = div()
+                    .absolute()
+                    .left(px(b.x))
+                    .top(px(b.y))
+                    .w(px(b.w))
+                    .h(px(b.h))
+                    .overflow_hidden()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme.accent)
+                    .child(
+                        img(thumb.clone())
+                            .absolute()
+                            .left(px(-b.x - 1.))
+                            .top(px(-b.y - 1.))
+                            .w(px(iw))
+                            .h(px(ih)),
+                    );
+                // This replays on every keystroke, so it stays short: typing
+                // is the most frequent thing anyone does here.
+                if calm {
+                    inner = inner.child(lit);
+                } else {
+                    let id = ElementId::Name(format!("press-{}-{i}-{j}", self.generation).into());
+                    inner = inner.child(lit.with_animation(
+                        id,
+                        Animation::new(PRESS).with_easing(ease_out_quint()),
+                        |el, t| el.opacity(t),
+                    ));
+                }
+            }
+        }
+
+        inner = inner.child(
+            div()
+                .absolute()
+                .size_full()
+                .rounded(radius)
+                .border_1()
+                .border_color(theme.image_edge),
+        );
+
+        let mut tile = div()
+            .id(("tile", i))
+            .relative()
+            .flex_none()
+            .w(px(w))
+            .h(px(h))
+            .rounded(px(RADIUS))
+            .bg(theme.tile)
+            .cursor(CursorStyle::PointingHand)
+            .opacity(presence)
+            .child(inner);
+
+        if m > 0.0 {
+            // The check mark is ringed in the panel color so it
+            // reads on a white page and a black terminal alike.
+            tile = tile.child(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .left(px(3.))
+                    .size(px(20.))
+                    .rounded_full()
+                    .bg(theme.text)
+                    .border_2()
+                    .border_color(theme.panel)
+                    .opacity(m)
+                    .child(check(theme.panel)),
+            );
+        }
+
+        if i == self.selected && presence == 1.0 {
+            // Offset outward by 3 px, so the radius grows by 3 too, the ring
+            // stays concentric with the tile's corners.
+            tile = tile.child(
+                div()
+                    .absolute()
+                    .top(px(-3.))
+                    .left(px(-3.))
+                    .w(px(w + 6.))
+                    .h(px(h + 6.))
+                    .rounded(px(RADIUS + 3.))
+                    .border_2()
+                    .border_color(theme.text),
+            );
+        }
+
+        tile.child(
+            canvas(
+                move |bounds, _, _| sink.borrow_mut().insert(i, bounds),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+            let mods = e.modifiers();
+            if mods.secondary() {
+                this.toggle_mark(i, cx);
+            } else if mods.shift {
+                this.extend_to(Some(i), cx);
+            } else {
+                this.confirming = false;
+                this.anchor = None;
+                this.selected = i;
+                this.show(i, cx);
+            }
+        }))
+        .into_any_element()
+    }
+
+    /// How present a tile is, 1 normally, heading to 0 on its way to the
+    /// trash or up from 0 on its way back, and whether that's still moving.
+    fn presence(&self, id: i64, calm: bool) -> (f32, bool) {
+        let Some(f) = self.fading.get(&id) else {
+            return (1.0, false);
+        };
+        let t = if calm {
+            1.0
+        } else {
+            (f.since.elapsed().as_secs_f32() / TILE_FADE.as_secs_f32()).min(1.0)
+        };
+        let eased = ease_out_quint()(t);
+        (if f.arriving { eased } else { 1.0 - eased }, t < 1.0)
+    }
+
+    /// How far into its marked look a tile is, 0 to 1, and whether that's
+    /// still moving.
+    fn mark_progress(&self, id: i64, calm: bool) -> (f32, bool) {
+        let (on, since) = match (self.marked.get(&id), self.unmarking.get(&id)) {
+            (Some(t), _) => (true, *t),
+            (None, Some(t)) => (false, *t),
+            (None, None) => return (0.0, false),
+        };
+        let t = if calm {
+            1.0
+        } else {
+            (since.elapsed().as_secs_f32() / MARK.as_secs_f32()).min(1.0)
+        };
+        let eased = ease_out_quint()(t);
+        (if on { eased } else { 1.0 - eased }, t < 1.0)
+    }
+
+    fn render_header(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        // While searching, how many matched. While browsing, when the selected
+        // one was taken, which is the one thing the grid itself can't show.
+        let count = if self.searching() {
+            let n = self.hits.len();
+            match n {
+                0 => String::new(),
+                SEARCH_LIMIT.. => format!("{}+", thousands(n)),
+                _ => thousands(n),
+            }
+        } else {
+            self.hits
+                .get(self.selected)
+                .map(|h| taken_at(h.mtime))
+                .unwrap_or_default()
+        };
+        div()
+            .flex_none()
+            .h(px(HEADER))
+            .flex()
+            .items_center()
+            .gap_4()
+            .px(px(PAD + 8.))
+            .border_b_1()
+            .border_color(theme.hairline)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(21.))
+                    .line_height(px(30.))
+                    .child(self.input.clone()),
+            )
+            .child(div().text_sm().text_color(theme.muted).child(count))
+            .child(
+                div()
+                    .id("settings-hint")
+                    .cursor(CursorStyle::PointingHand)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_settings(window, cx)
+                    }))
+                    .child(hint("ctrl ,", "settings", theme)),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty(&self, theme: Theme) -> impl IntoElement + use<> {
+        let (title, body): (SharedString, SharedString) = if self.searchable == 0 {
+            (
+                "nothing read yet".into(),
+                "screenshots show up here as they're read. if nothing happens, check settings (ctrl ,)".into(),
+            )
+        } else {
+            (
+                format!("nothing says \u{201c}{}\u{201d}", self.query.trim()).into(),
+                "fewer letters usually finds it, the middle of a word works too".into(),
+            )
+        };
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .pb(px(HEADER))
+            .child(div().text_lg().font_weight(FontWeight::MEDIUM).child(title))
+            .child(div().text_sm().text_color(theme.muted).child(body))
+    }
+
+    fn render_scrollbar(&self, theme: Theme) -> Option<impl IntoElement + use<>> {
+        let max = self.list.max_offset_for_scrollbar().y.as_f32();
+        let viewport = self.list.viewport_bounds();
+        let height = viewport.size.height.as_f32();
+        if max <= 1.0 || height <= 0.0 {
+            return None;
+        }
+        let offset = (-self.list.scroll_px_offset_for_scrollbar().y.as_f32()).clamp(0.0, max);
+        let thumb = (height * height / (height + max)).max(28.0);
+        let top = (height - thumb) * offset / max;
+        Some(
+            div()
+                .absolute()
+                .right(px(4.))
+                .top(px(HEADER + top))
+                .w(px(4.))
+                .h(px(thumb))
+                .rounded_full()
+                .bg(theme.faint)
+                .opacity(0.5),
+        )
+    }
+
+    fn render_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = *cx.global::<Theme>();
+        let viewport = window.viewport_size();
+        let corner = self.corner();
+        let shown = self.detail.as_ref()?.hit;
+        let thumb_path = self.thumb_paths.get(shown)?.clone();
+        let full_path = self.hits.get(shown)?.path.clone();
+        let thumb = self.image(&thumb_path, Some(&full_path), window, cx);
+        let full = self.image(&full_path, None, window, cx);
+        let d = self.detail.as_mut()?;
+        let hit = self.hits.get(d.hit)?;
+        let p = d.open.value;
+
+        let area = Bounds::new(
+            point(px(DETAIL_PAD), px(DETAIL_TOP)),
+            size(
+                viewport.width - px(DETAIL_PAD * 2.),
+                viewport.height - px(DETAIL_TOP + DETAIL_BOTTOM),
+            ),
+        );
+        let scale = window.scale_factor();
+        let native = (hit.width as f32 / scale, hit.height as f32 / scale);
+        let target = fit(hit.width as f32 / hit.height.max(1) as f32, area, native);
+        // The tile only shows the crop, so the full image starts out as the
+        // rectangle that would put the crop exactly where the tile was.
+        let crop = akshat_core::tile_crop(hit.width, hit.height);
+        let from = Bounds::new(
+            point(
+                d.from.origin.x - d.from.size.width * (crop.x / crop.w),
+                d.from.origin.y - d.from.size.height * (crop.y / crop.h),
+            ),
+            size(d.from.size.width / crop.w, d.from.size.height / crop.h),
+        );
+        let (rect, fade) = if d.grow {
+            (lerp_bounds(from, target, p), 1.0)
+        } else {
+            (target, p.clamp(0.0, 1.0))
+        };
+        d.image_rect = rect;
+        let chrome = ((p - 0.4) / 0.6).clamp(0.0, 1.0);
+
+        let thumb_rect = Bounds::new(
+            point(
+                rect.origin.x + rect.size.width * crop.x,
+                rect.origin.y + rect.size.height * crop.y,
+            ),
+            size(rect.size.width * crop.w, rect.size.height * crop.h),
+        );
+        let radius = px(RADIUS + (6.0 - RADIUS) * p);
+
+        let mut boxes = Vec::new();
+        for (i, line) in d.lines.iter().enumerate() {
+            let b = on_screen(line.rect, rect).dilate(px(3.));
+            // Keep search matches and the current selection visually distinct.
+            let (bg, border) = if d.picked.contains(&i) {
+                (theme.hover_wash, Some(theme.text))
+            } else if d.matched.get(i).copied().unwrap_or(false) {
+                (theme.accent_wash, Some(theme.accent))
+            } else if d.hovered == Some(i) {
+                (theme.hover_wash, None)
+            } else {
+                continue;
+            };
+            let mut el = div()
+                .absolute()
+                .left(b.origin.x)
+                .top(b.origin.y)
+                .w(b.size.width)
+                .h(b.size.height)
+                .rounded(px(4.))
+                .bg(bg);
+            if let Some(border) = border {
+                el = el.border_1().border_color(border);
+            }
+            boxes.push(el.opacity(chrome));
+        }
+
+        let drag = d
+            .drag
+            .filter(|(a, b)| (a.x - b.x).abs() > px(4.) || (a.y - b.y).abs() > px(4.))
+            .map(|(a, b)| {
+                let r = Bounds::from_corners(a.min(&b), a.max(&b));
+                div()
+                    .absolute()
+                    .left(r.origin.x)
+                    .top(r.origin.y)
+                    .w(r.size.width)
+                    .h(r.size.height)
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme.accent)
+                    .bg(theme.accent_wash)
+                    .opacity(0.6)
+            });
+
+        let name = hit
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let when = taken_at(hit.mtime);
+
+        Some(
+            div()
+                .id("detail")
+                .absolute()
+                .size_full()
+                .occlude()
+                .cursor(if d.hovered.is_some() {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::Arrow
+                })
+                .on_mouse_move(cx.listener(Self::detail_mouse_move))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::detail_mouse_down))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::detail_mouse_up))
+                .child(
+                    div()
+                        .absolute()
+                        .size_full()
+                        .rounded(corner)
+                        .bg(theme.panel)
+                        .opacity(p.clamp(0.0, 1.0)),
+                )
+                // The thumbnail is already decoded, so it carries the move
+                // until the full size image lands on top of it.
+                .children(thumb.map(|t| {
+                    img(t)
+                        .absolute()
+                        .left(thumb_rect.origin.x)
+                        .top(thumb_rect.origin.y)
+                        .w(thumb_rect.size.width)
+                        .h(thumb_rect.size.height)
+                        .rounded(radius)
+                        .opacity(fade)
+                }))
+                .children(full.map(|f| {
+                    img(f)
+                        .absolute()
+                        .left(rect.origin.x)
+                        .top(rect.origin.y)
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .rounded(radius)
+                        .opacity(fade)
+                }))
+                .children(boxes)
+                .children(drag)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(DETAIL_TOP))
+                        .px(px(DETAIL_PAD + 4.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .opacity(chrome)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_ellipsis()
+                                .child(name),
+                        )
+                        .child(div().text_sm().text_color(theme.muted).child(when)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(DETAIL_BOTTOM))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_5()
+                        .opacity(chrome)
+                        .child(hint("esc", "back", theme))
+                        .child(hint("ctrl c", "copy text", theme))
+                        .child(hint("ctrl shift c", "copy image", theme))
+                        .child(hint("enter", "open", theme))
+                        .child(hint("ctrl del", "trash", theme))
+                        .child(hint("\u{2190} \u{2192}", "next", theme)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// While shots are marked: how many, and what can be done with them.
+    /// After ctrl delete it turns into the question itself.
+    fn render_mark_bar(
+        &mut self,
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let count = if self.confirming {
+            self.trash_targets().len()
+        } else {
+            self.marked.len()
+        };
+        let showing = (self.confirming || self.detail.is_none()) && count > 0 && !self.on_panel();
+        let calm = self.calm(cx);
+
+        // Gone from the state, the bar still sinks away saying what it said.
+        let mut leaving = None;
+        if showing {
+            self.bar_leaving = None;
+            self.bar_last = Some(Bar {
+                count,
+                confirming: self.confirming,
+                can_mark_more: self.searching() && count < self.hits.len(),
+            });
+        } else {
+            self.bar_shown = None;
+            self.bar_last?;
+            let since = *self.bar_leaving.get_or_insert_with(Instant::now);
+            let t = since.elapsed().as_secs_f32() / BAR_OUT.as_secs_f32();
+            if calm || t >= 1.0 {
+                self.bar_last = None;
+                self.bar_leaving = None;
+                return None;
+            }
+            window.request_animation_frame();
+            leaving = Some(ease_out_quint()(t));
+        }
+        let state = self.bar_last?;
+        let n = state.count;
+        let shown = match self.bar_shown {
+            Some(b) => b,
+            None if showing => {
+                self.bars += 1;
+                self.bar_shown = Some(self.bars);
+                self.bars
+            }
+            None => 0,
+        };
+
+        let mut row = div().flex().items_center().gap_2();
+        if state.confirming {
+            let question = if n == 1 {
+                "move this screenshot to the trash?".to_string()
+            } else {
+                format!("move {} screenshots to the trash?", thousands(n))
+            };
+            row = row
+                .child(div().font_weight(FontWeight::MEDIUM).pr_2().child(question))
+                .child(button(
+                    "bar-yes",
+                    "enter",
+                    "move",
+                    theme,
+                    cx.listener(|this, _, _, cx| this.trash_now(cx)),
+                ))
+                .child(button(
+                    "bar-no",
+                    "esc",
+                    "cancel",
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.confirming = false;
+                        cx.notify();
+                    }),
+                ));
+        } else {
+            row = row
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .pr_2()
+                        .child(format!("{} marked", thousands(n))),
+                )
+                .child(button(
+                    "bar-trash",
+                    "ctrl del",
+                    "move to trash",
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.confirming = true;
+                        cx.notify();
+                    }),
+                ))
+                .when(state.can_mark_more, |row| {
+                    row.child(button(
+                        "bar-all",
+                        "ctrl shift a",
+                        "mark all",
+                        theme,
+                        cx.listener(|this, _, window, cx| this.mark_all(&MarkAll, window, cx)),
+                    ))
+                })
+                .child(button(
+                    "bar-clear",
+                    "esc",
+                    "clear",
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.clear_marks();
+                        cx.notify();
+                    }),
+                ));
+        }
+
+        // Turning into the question (and back) swaps what it says with a
+        // quick fade rather than a cut.
+        let row = if calm {
+            row.into_any_element()
+        } else {
+            row.with_animation(
+                ElementId::Name(format!("bar-{shown}-{}", state.confirming).into()),
+                Animation::new(BAR_SWAP).with_easing(ease_out_quint()),
+                |el, t| el.opacity(t),
+            )
+            .into_any_element()
+        };
+        let pill = div()
+            .pl_4()
+            .pr_1p5()
+            .py_1p5()
+            .rounded_full()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.hairline)
+            .shadow_lg()
+            .text_sm()
+            .child(row);
+        let bar = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(16.))
+            .flex()
+            .justify_center()
+            .child(pill);
+
+        if let Some(t) = leaving {
+            return Some(
+                bar.bottom(px(16. - 8. * t))
+                    .opacity(1. - t)
+                    .into_any_element(),
+            );
+        }
+        if calm {
+            return Some(bar.into_any_element());
+        }
+        Some(
+            bar.with_animation(
+                ElementId::Name(format!("bar-{shown}").into()),
+                Animation::new(BAR_IN).with_easing(ease_out_quint()),
+                |el, t| el.bottom(px(8. + 8. * t)).opacity(t),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn render_toast(&self, theme: Theme) -> Option<impl IntoElement + use<>> {
+        let toast = self.toast.as_ref()?;
+        let (id, leaving) = (toast.id, toast.leaving);
+        // The fade out has its own id so it starts fresh instead of carrying
+        // on from where the fade in ended.
+        let phase = if leaving { "out" } else { "in" };
+        Some(
+            div()
+                .absolute()
+                .bottom(px(DETAIL_BOTTOM + 12.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .rounded_full()
+                        .bg(theme.text)
+                        .text_color(theme.panel)
+                        .text_sm()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(toast.message.clone())
+                        .children(toast.keys.map(|(keys, what)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_xs()
+                                .opacity(0.7)
+                                .child(
+                                    div()
+                                        .px(px(6.))
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(theme.panel)
+                                        .child(keys),
+                                )
+                                .child(what)
+                        }))
+                        .with_animation(
+                            ElementId::Name(format!("toast-{id}-{phase}").into()),
+                            Animation::new(TOAST_FADE).with_easing(ease_out_quint()),
+                            move |el, t| el.opacity(if leaving { 1.0 - t } else { t }),
+                        ),
+                ),
+        )
+    }
+}
+
+impl Focusable for Akshat {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.page {
+            Page::Search => self.input.focus_handle(cx),
+            Page::Settings(_) | Page::Onboarding(_) => self.panel_focus.clone(),
+        }
+    }
+}
+
+impl Render for Akshat {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let started = self.stats.begin();
+        let theme = *cx.global::<Theme>();
+
+        // The real time since the last frame, so motion takes as long on a
+        // slow machine as on a fast one (it just gets fewer frames). Capping
+        // this at a 30 fps step made a 0.2 s fade last seconds where frames
+        // take 150 ms. The spring sub-steps big gaps itself.
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.25);
+        self.last_frame = now;
+        if let Some(d) = &mut self.detail {
+            if !d.open.is_settled() {
+                d.open.step(dt);
+                window.request_animation_frame();
+            } else if d.open.target() == 0.0 {
+                self.detail = None;
+            }
+        }
+
+        let width = window.viewport_size().width.as_f32() - PAD * 2.0;
+        if (width - self.laid_out_for).abs() > 0.5 && width > 0.0 {
+            self.relayout(width);
+        }
+
+        let toast = self.render_toast(theme);
+        let mut content: Vec<AnyElement> = match self.page {
+            Page::Settings(_) => vec![self.render_settings(theme, cx)],
+            Page::Onboarding(_) => vec![self.render_onboarding(theme, cx)],
+            Page::Search => {
+                let body: AnyElement = if self.hits.is_empty() {
+                    self.render_empty(theme).into_any_element()
+                } else {
+                    list(self.list.clone(), cx.processor(Self::render_row))
+                        .flex_1()
+                        .size_full()
+                        .pt(px(6.))
+                        .into_any_element()
+                };
+                let mut content = vec![self.render_header(theme, cx), body];
+                content.extend(self.render_scrollbar(theme).map(|s| s.into_any_element()));
+                content.extend(self.render_detail(window, cx));
+                content.extend(self.render_mark_bar(theme, window, cx));
+                content
+            }
+        };
+        // Settings and onboarding get their own focus and key context, so
+        // space and delete mean "toggle" and "remove" there instead of typing.
+        let panel = self.on_panel().then(|| {
+            div()
+                .key_context("Panel")
+                .track_focus(&self.panel_focus)
+                .on_action(cx.listener(Self::toggle))
+                .on_action(cx.listener(Self::remove))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .children(content.drain(..))
+        });
+
+        let root = div()
+            .key_context("Akshat")
+            .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(Self::open))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::copy_text))
+            .on_action(cx.listener(Self::copy_image))
+            .on_action(cx.listener(Self::open_external))
+            .on_action(cx.listener(Self::reveal))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::mark_up))
+            .on_action(cx.listener(Self::mark_down))
+            .on_action(cx.listener(Self::mark_left))
+            .on_action(cx.listener(Self::mark_right))
+            .on_action(cx.listener(Self::mark_all))
+            .on_action(cx.listener(Self::trash))
+            .on_action(cx.listener(Self::undo))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(theme.panel)
+            .rounded(self.corner())
+            .when(self.floating, |panel| {
+                panel.border_1().border_color(theme.hairline)
+            })
+            .text_color(theme.text)
+            .children(panel)
+            .children(content)
+            .children(toast);
+        self.stats.end(started);
+        root
+    }
+}
+
+/// A check mark drawn as a stroke. The font's ✓ at this size reads as a v.
+fn check(color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |b, _, window, _| {
+            let at = |x: f32, y: f32| {
+                point(
+                    b.origin.x + b.size.width * x,
+                    b.origin.y + b.size.height * y,
+                )
+            };
+            let mut path = PathBuilder::stroke(px(1.75));
+            path.move_to(at(0.28, 0.52));
+            path.line_to(at(0.44, 0.67));
+            path.line_to(at(0.73, 0.35));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size_full()
+}
+
+/// A key hint that can also be clicked, for whoever reached for the mouse.
+fn button(
+    id: &'static str,
+    keys: &'static str,
+    what: &'static str,
+    theme: Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .cursor(CursorStyle::PointingHand)
+        .hover(move |s| s.bg(theme.hover_wash))
+        .on_click(on_click)
+        .child(hint(keys, what, theme))
+}
+
+fn hint(keys: &'static str, what: &'static str, theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .child(
+            div()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(5.))
+                .bg(theme.keycap)
+                .border_1()
+                .border_color(theme.hairline)
+                .text_color(theme.text)
+                .child(keys),
+        )
+        .child(div().text_color(theme.muted).child(what))
+}
+
+/// A line's box in tile pixels, grown a little so the outline doesn't sit on
+/// the glyphs. None when the line falls outside the part the tile shows.
+fn in_tile(r: Rect, crop: Rect, w: f32, h: f32) -> Option<Rect> {
+    const GROW: f32 = 2.0;
+    let x0 = ((r.x - crop.x) / crop.w * w - GROW).max(0.0);
+    let y0 = ((r.y - crop.y) / crop.h * h - GROW).max(0.0);
+    let x1 = ((r.x + r.w - crop.x) / crop.w * w + GROW).min(w);
+    let y1 = ((r.y + r.h - crop.y) / crop.h * h + GROW).min(h);
+    (x1 - x0 >= 3.0 && y1 - y0 >= 3.0).then_some(Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+fn on_screen(r: Rect, image: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        point(
+            image.origin.x + image.size.width * r.x,
+            image.origin.y + image.size.height * r.y,
+        ),
+        size(image.size.width * r.w, image.size.height * r.h),
+    )
+}
+
+/// The largest rectangle of this aspect that fits in `area`, centred, but no
+/// bigger than `native` (the screenshot's own size in logical pixels). A
+/// small crop blown up to fill the window just looks broken.
+fn fit(aspect: f32, area: Bounds<Pixels>, native: (f32, f32)) -> Bounds<Pixels> {
+    let (aw, ah) = (area.size.width.as_f32(), area.size.height.as_f32());
+    let (w, h) = if aw / ah > aspect {
+        (ah * aspect, ah)
+    } else {
+        (aw, aw / aspect)
+    };
+    let shrink = (native.0 / w).min(native.1 / h).min(1.0);
+    let (w, h) = (w * shrink, h * shrink);
+    Bounds::new(
+        point(
+            area.origin.x + px((aw - w) / 2.0),
+            area.origin.y + px((ah - h) / 2.0),
+        ),
+        size(px(w), px(h)),
+    )
+}
+
+fn lerp_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>, t: f32) -> Bounds<Pixels> {
+    let l = |x: Pixels, y: Pixels| x + (y - x) * t;
+    Bounds::new(
+        point(l(a.origin.x, b.origin.x), l(a.origin.y, b.origin.y)),
+        size(
+            l(a.size.width, b.size.width),
+            l(a.size.height, b.size.height),
+        ),
+    )
+}
+
+fn placeholder(searchable: usize) -> SharedString {
+    match searchable {
+        0 => "nothing to search yet".into(),
+        1 => "search 1 screenshot".into(),
+        n => format!("search {} screenshots", thousands(n)).into(),
+    }
+}
+
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn taken_at(mtime: i64) -> String {
+    jiff::Timestamp::from_second(mtime)
+        .map(|t| {
+            t.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%-d %b %Y, %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+// A Wayland clipboard is served by the app that set it, so text copied with
+// gpui's own clipboard vanishes the moment this window closes. wl-copy forks
+// a tiny process that keeps serving it, which is what makes "copy, esc,
+// paste" work.
+fn copy_text(text: &str, cx: &mut App) {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && pipe("wl-copy", &[], text.as_bytes()) {
+        return;
+    }
+    cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+}
+
+fn copy_image(path: &Path) -> bool {
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        pipe("wl-copy", &["--type", mime], &bytes)
+    } else {
+        pipe("xclip", &["-selection", "clipboard", "-t", mime], &bytes)
+    }
+}
+
+fn pipe(program: &str, args: &[&str], input: &[u8]) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(input).is_ok());
+    child.wait().is_ok_and(|s| s.success()) && wrote
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thousands_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(5159), "5,159");
+        assert_eq!(thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn boxes_outside_the_crop_are_dropped() {
+        let crop = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 0.5,
+        };
+        let below = Rect {
+            x: 0.1,
+            y: 0.7,
+            w: 0.3,
+            h: 0.05,
+        };
+        assert!(in_tile(below, crop, 200.0, 400.0).is_none());
+        let inside = Rect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.3,
+            h: 0.05,
+        };
+        let b = in_tile(inside, crop, 200.0, 400.0).unwrap();
+        assert!((b.y - (0.2 * 400.0 - 2.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fit_keeps_the_aspect_and_centres() {
+        let area = Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(500.)));
+        let r = fit(1.0, area, (4000.0, 4000.0));
+        assert_eq!(r.size, size(px(500.), px(500.)));
+        assert_eq!(r.origin.x, px(250.));
+    }
+
+    #[test]
+    fn fit_never_blows_a_small_shot_up() {
+        let area = Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(500.)));
+        let r = fit(586.0 / 134.0, area, (586.0, 134.0));
+        let close = |a: Pixels, b: f32| (a.as_f32() - b).abs() < 0.01;
+        assert!(
+            close(r.size.width, 586.) && close(r.size.height, 134.),
+            "{:?}",
+            r.size
+        );
+        assert!(
+            close(r.origin.x, 207.) && close(r.origin.y, 183.),
+            "{:?}",
+            r.origin
+        );
+    }
+}

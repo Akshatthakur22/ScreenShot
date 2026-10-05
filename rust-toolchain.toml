@@ -1,0 +1,5 @@
+[toolchain]
+# gpui from zed main needs 1.95 (it calls std::hint::cold_path). Keep this in
+# step with zed's own rust-toolchain.toml when bumping the gpui rev.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

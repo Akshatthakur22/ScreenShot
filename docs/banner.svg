@@ -1,0 +1,119 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 1280 300"
+  width="2560"
+  height="600"
+  role="img"
+  aria-label="Akshat: search every screenshot by the text inside it"
+>
+  <title>Akshat</title>
+  <!-- The README banner, in the app's dark theme (crates/app/src/theme.rs).
+       Same anatomy as the window mid-search: a query, and a grid of prints
+       dimmed with only the matched lines lit and outlined in blue.
+       Every tile is drawn, none of it is a real screenshot. -->
+  <rect width="1280" height="300" fill="#141416"/>
+
+  <text x="86" y="112" font-family="system-ui, sans-serif" font-size="60" font-weight="600" letter-spacing="-1.2" fill="#ecebe7">Akshat</text>
+  <text x="88" y="152" font-family="system-ui, sans-serif" font-size="22" fill="#9b9a95">search every screenshot by the text inside it</text>
+
+  <!-- The search field, with a word typed and the caret after it. -->
+  <rect x="88.5" y="186.5" width="470" height="52" rx="10" fill="#222226" stroke="#ffffff" stroke-opacity="0.08"/>
+  <text x="110" y="220" font-family="system-ui, sans-serif" font-size="22" font-weight="500" fill="#ecebe7">invoice</text>
+  <rect x="188" y="200" width="2" height="26" rx="1" fill="#60a5fa"/>
+
+  <!-- The grid. Each tile has bars for text. Matching lines are bright
+       and outlined in blue. -->
+  <defs>
+    <clipPath id="t"><rect width="180" height="112" rx="6"/></clipPath>
+    <g id="veil"><rect width="180" height="112" rx="6" fill="#000000" fill-opacity="0.5"/></g>
+    <g id="edge"><rect x="0.5" y="0.5" width="179" height="111" rx="6" fill="none" stroke="#ffffff" stroke-opacity="0.1"/></g>
+  </defs>
+
+  <g fill="#5f5e5a">
+    <!-- row 1 -->
+    <g transform="translate(672 31)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect width="180" height="16" fill="#2c2c31"/>
+        <rect x="12" y="28" width="96" height="7" rx="2"/>
+        <rect x="12" y="44" width="140" height="5" rx="2"/>
+        <rect x="12" y="56" width="120" height="5" rx="2"/>
+        <rect x="12" y="68" width="150" height="5" rx="2"/>
+        <rect x="12" y="92" width="60" height="9" rx="2"/>
+        <use href="#veil"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+    <g transform="translate(866 31)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect width="44" height="112" fill="#2a2a2f"/>
+        <rect x="8" y="14" width="28" height="5" rx="2"/>
+        <rect x="8" y="26" width="24" height="5" rx="2"/>
+        <rect x="8" y="38" width="30" height="5" rx="2"/>
+        <rect x="56" y="14" width="80" height="8" rx="2"/>
+        <rect x="56" y="54" width="104" height="5" rx="2"/>
+        <rect x="56" y="66" width="90" height="5" rx="2"/>
+        <rect x="56" y="78" width="110" height="5" rx="2"/>
+        <use href="#veil"/>
+        <rect x="56" y="33" width="84" height="9" rx="2" fill="#ecebe7" fill-opacity="0.92"/>
+        <rect x="52.5" y="29.5" width="91" height="16" rx="3.5" fill="#60a5fa" fill-opacity="0.2" stroke="#60a5fa" stroke-width="1.5"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+    <g transform="translate(1060 31)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect x="14" y="16" width="70" height="6" rx="2"/>
+        <rect x="14" y="32" width="152" height="40" rx="3" fill="#2c2c31"/>
+        <rect x="14" y="82" width="130" height="5" rx="2"/>
+        <rect x="14" y="94" width="100" height="5" rx="2"/>
+        <use href="#veil"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+
+    <!-- row 2 -->
+    <g transform="translate(672 157)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect x="14" y="14" width="110" height="8" rx="2"/>
+        <rect x="14" y="52" width="150" height="5" rx="2"/>
+        <rect x="14" y="64" width="136" height="5" rx="2"/>
+        <rect x="14" y="76" width="146" height="5" rx="2"/>
+        <rect x="14" y="88" width="80" height="5" rx="2"/>
+        <use href="#veil"/>
+        <rect x="14" y="31" width="64" height="9" rx="2" fill="#ecebe7" fill-opacity="0.92"/>
+        <rect x="10.5" y="27.5" width="71" height="16" rx="3.5" fill="#60a5fa" fill-opacity="0.2" stroke="#60a5fa" stroke-width="1.5"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+    <g transform="translate(866 157)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect width="180" height="16" fill="#2c2c31"/>
+        <rect x="12" y="30" width="46" height="46" rx="4" fill="#2c2c31"/>
+        <rect x="68" y="32" width="90" height="6" rx="2"/>
+        <rect x="68" y="46" width="70" height="5" rx="2"/>
+        <rect x="68" y="58" width="96" height="5" rx="2"/>
+        <rect x="12" y="88" width="150" height="5" rx="2"/>
+        <use href="#veil"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+    <g transform="translate(1060 157)">
+      <g clip-path="url(#t)">
+        <rect width="180" height="112" fill="#222226"/>
+        <rect x="14" y="16" width="130" height="5" rx="2"/>
+        <rect x="14" y="28" width="150" height="5" rx="2"/>
+        <rect x="14" y="40" width="110" height="5" rx="2"/>
+        <rect x="14" y="86" width="140" height="5" rx="2"/>
+        <rect x="14" y="98" width="90" height="5" rx="2"/>
+        <use href="#veil"/>
+        <rect x="14" y="62" width="120" height="9" rx="2" fill="#ecebe7" fill-opacity="0.92"/>
+        <rect x="10.5" y="58.5" width="127" height="16" rx="3.5" fill="#60a5fa" fill-opacity="0.2" stroke="#60a5fa" stroke-width="1.5"/>
+      </g>
+      <use href="#edge"/>
+    </g>
+  </g>
+</svg>

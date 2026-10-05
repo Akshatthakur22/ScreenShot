@@ -1,0 +1,18 @@
+[package]
+name = "akshat"
+description = "Search every screenshot you have ever taken by the text inside it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+akshat-core.workspace = true
+akshat-ocr.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+fast_image_resize = { version = "5", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+libc = "0.2"
+notify = "8"

@@ -1,0 +1,17 @@
+[package]
+name = "akshat-core"
+description = "Screenshot index with OCR text, bounding boxes, and full-text search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+jiff = "0.2"
+libc = "0.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "1"

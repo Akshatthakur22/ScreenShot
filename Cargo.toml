@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/ocr", "crates/cli", "crates/app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Akshat"]
+
+[workspace.dependencies]
+akshat-core = { path = "crates/core" }
+akshat-ocr = { path = "crates/ocr" }
+anyhow = "1.0"
+directories = "6.0"
+
+# Image decoding and the per pixel loops around OCR crawl at opt-level 0, and
+# testing on a few thousand real screenshots is the normal dev loop here.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+# Full debug info for gpui, wgpu and the rest filled 18 GB of target/debug
+# and ran the disk out. Backtraces through our own code are what matter.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Optimised, but without the link time work, so the distro builds in CI
+# finish in minutes. Not for shipping.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
