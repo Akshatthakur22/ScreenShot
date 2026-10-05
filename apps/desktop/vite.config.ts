@@ -1,0 +1,18 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    strictPort: true,
+    port: 1420,
+    host: "127.0.0.1",
+    hmr: process.env.TAURI_DEV_HOST
+      ? { host: process.env.TAURI_DEV_HOST, protocol: "ws", port: 1421 }
+      : undefined,
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
+  },
+});

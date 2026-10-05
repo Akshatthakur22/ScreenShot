@@ -6,6 +6,8 @@ Akshat is a personal Linux desktop development project for searching screenshots
 
 This repository is maintained as a personal development project. The performance figures and compatibility notes in `docs/` and `notes.md` were inherited from the source project and have not been independently verified in this checkout.
 
+The first macOS desktop shell is in [`apps/desktop`](apps/desktop/README.md). It verifies a React-to-Tauri call into the existing Rust core. Screenshot capture and memory features are not implemented in this shell.
+
 ## Development setup
 
 The workspace uses Rust 1.95. Install the system build dependencies required by GPUI, Wayland/X11, and fontconfig for your Linux distribution, then run:

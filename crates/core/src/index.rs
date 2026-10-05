@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::{Line, Rect, Shot};
 
-// Bump this whenever the tables change. There are no migrations yet, the
-// index is just a cache of OCR output, so an old one gets dropped and rebuilt.
+// Bump this with a preserving migration. Unknown versions are rejected rather
+// than reset so an application upgrade cannot silently erase indexed data.
 const SCHEMA: i32 = 1;
 
 // The trigram tokenizer indexes every 3 character window, which is what makes
@@ -63,21 +63,28 @@ impl Index {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(db: Connection) -> Result<Self> {
+    fn init(mut db: Connection) -> Result<Self> {
         // WAL so the watcher can write while the app is reading.
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         db.pragma_update(None, "foreign_keys", true)?;
 
         let version: i32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != SCHEMA {
-            db.execute_batch(
-                "DROP TABLE IF EXISTS shots_fts;
-                 DROP TABLE IF EXISTS lines;
-                 DROP TABLE IF EXISTS shots;",
+        if version == 0 {
+            let objects: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
             )?;
-            db.execute_batch(TABLES)?;
-            db.pragma_update(None, "user_version", SCHEMA)?;
+            if objects != 0 {
+                bail!("unversioned database contains data; refusing to replace it");
+            }
+            let tx = db.transaction()?;
+            tx.execute_batch(TABLES)?;
+            tx.execute_batch("PRAGMA user_version = 1;")?;
+            tx.commit()?;
+        } else if version != SCHEMA {
+            bail!("unsupported index schema version {version}; refusing destructive reset");
         }
         Ok(Self { db })
     }
@@ -201,6 +208,36 @@ impl Index {
                 r.get(0)
             })?;
         Ok(n as usize)
+    }
+
+    /// Counts OCR lines stored for all indexed screenshots.
+    pub fn line_len(&self) -> Result<usize> {
+        let n: i64 = self
+            .db
+            .query_row("SELECT count(*) FROM lines", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Returns one indexed screenshot by its stable database ID.
+    pub fn get(&self, id: i64) -> Result<Option<Hit>> {
+        let hit = self
+            .db
+            .query_row(
+                "SELECT id, path, mtime, width, height FROM shots WHERE id = ?1 AND width > 0",
+                [id],
+                |r| {
+                    Ok(Hit {
+                        id: r.get(0)?,
+                        path: PathBuf::from(r.get::<_, String>(1)?),
+                        mtime: r.get(2)?,
+                        width: r.get(3)?,
+                        height: r.get(4)?,
+                        lines: Vec::new(),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(hit)
     }
 
     pub fn is_empty(&self) -> Result<bool> {
@@ -386,6 +423,32 @@ mod tests {
         )
         .unwrap();
         idx
+    }
+
+    #[test]
+    fn unsupported_schema_is_rejected_without_dropping_existing_tables() {
+        let path = std::env::temp_dir().join(format!(
+            "akshat-schema-guard-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE preserved(value TEXT); INSERT INTO preserved VALUES ('kept'); PRAGMA user_version = 42;")
+                .unwrap();
+        }
+
+        assert!(Index::open(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let value: String = db
+            .query_row("SELECT value FROM preserved", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     fn paths(hits: &[Hit]) -> Vec<&str> {

@@ -1,0 +1,25 @@
+[package]
+name = "akshat-desktop"
+version = "0.0.1"
+description = "Akshat macOS desktop shell"
+authors = ["Akshat"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "akshat_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dependencies]
+akshat-core = { path = "../../../crates/core" }
+akshat-application = { path = "../../../crates/application" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+
+[workspace]

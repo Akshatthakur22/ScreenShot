@@ -2601,6 +2601,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "akshat-application"
+version = "0.0.1"
+dependencies = [
+ "akshat-core",
+ "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "akshat-core"
 version = "0.0.1"
 dependencies = [
